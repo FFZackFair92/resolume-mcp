@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Log e output runtime
+*.log
+*.err
+stop.flag
+job.json
+
+# Catture webcam / frame generati
+diagnosi.jpg
+palco.jpg
+stage.jpg
+
+# Backup
+*.backup.xml
+
+# Media pesanti (restano solo in locale)
+GraficheFX/
+halloween90s/
+ReliefLED/
+*.mov
+*.mp4
+*.avi
+*.mkv
+*.webm
+*.wav
+*.out
+

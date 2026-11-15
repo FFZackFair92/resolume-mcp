@@ -1,0 +1,24 @@
+{
+  "_nota": "Tarato sul deck 3 'Generators': layer 1 ha 5 clip, layer 2 ne ha 4, layer 3 ne ha 3. Le liste si fermano li', altrimenti il pilota pesca slot vuoti e manda il layer in nero.",
+  "tick": 0.05,
+
+  "layers": [
+    {"layer": 1, "clips": [1, 2, 3, 4, 5], "beats": 32},
+    {"layer": 2, "clips": [1, 2, 3, 4], "beats": 16},
+    {"layer": 3, "clips": [1, 2, 3], "beats": 8}
+  ],
+
+  "effects": [
+    {"layer": 1, "effect": 2, "beats_on": 32, "beats_off": 96},
+    {"layer": 3, "effect": 3, "beats_on": 8, "beats_off": 56}
+  ],
+
+  "modulate": [
+    {"path": "layers[0]:Layer #/video/effects[2]:HueRotate/params/Hue Rotate",
+     "shape": "ramp", "min": 0.0, "max": 1.0, "beats": 64},
+    {"path": "layers[2]:Layer #/video/opacity",
+     "shape": "sine", "min": 0.35, "max": 0.75, "beats": 32},
+    {"path": "layers[2]:Layer #/video/effects[1]:PolarKaleido/params/Angle",
+     "shape": "ramp", "min": 0.0, "max": 1.0, "beats": 128}
+  ]
+}
