@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2,<2", "httpx>=0.27"]
+# dependencies = ["mcp>=1.10,<3", "httpx>=0.27"]
 # ///
 """MCP server per Resolume Arena/Avenue 7 (REST API).
 
@@ -11,6 +11,7 @@ Meccanica di scrittura: Resolume espone pochissime rotte. Tutto si scrive con
 PUT /api/v1/composition passando un corpo parziale che rispecchia l'albero JSON;
 gli array vanno riempiti con {} fino all'indice giusto. set_parameter fa questo.
 """
+import contextlib
 import json
 import os
 import random
@@ -23,9 +24,9 @@ from typing import Any
 
 import httpx
 try:  # mcp SDK 2.x
-    from mcp.server.mcpserver import MCPServer as FastMCP
+    from mcp.server.mcpserver import Image, MCPServer as FastMCP
 except ImportError:  # mcp SDK 1.x
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP, Image
 
 BASE = os.environ.get("RESOLUME_URL", "http://127.0.0.1:8080").rstrip("/") + "/api/v1"
 HERE = Path(__file__).resolve().parent
@@ -150,13 +151,14 @@ def list_effects() -> Any:
 # ---------------------------------------------------------------- scrittura
 
 @mcp.tool()
-def set_parameter(path: str, value: Any) -> str:
+def set_parameter(path: str, value: Any, verify: bool = False) -> Any:
     """Imposta un parametro dato il suo path (da find_parameters).
     Esempi:
       set_parameter('layers[0]:Layer #/video/opacity', 0.5)
       set_parameter('layers[0]:Layer #/video/effects[0]:Transform/params/Scale', 150)
       set_parameter('tempocontroller/tempo', 128)
-    value: numero, booleano, o la stringa esatta per i menu (vedi 'options')."""
+    value: numero, booleano, o la stringa esatta per i menu (vedi 'options').
+    verify=True rilegge il parametro e restituisce valore prima/dopo e se Resolume l'ha accettato."""
     # il valore puo' arrivare come stringa dal client MCP: Resolume in quel caso
     # risponde 'value is not double', quindi si riconverte prima di spedire
     if isinstance(value, str):
@@ -175,8 +177,26 @@ def set_parameter(path: str, value: Any) -> str:
             body = {m.group(1): [{} for _ in range(int(m.group(2)))] + [body]}
         else:
             body = {tok: body}
+    before = _read_path(path) if verify else None
     call("PUT", "/composition", body)
+    if verify:
+        after = _read_path(path)
+        return {"path": path, "value_before": before, "value_after": after,
+                "verified": after == value or (isinstance(after, (int, float)) and isinstance(value, (int, float))
+                                               and abs(after - value) < 1e-6)}
     return f"{path} = {value}"
+
+
+def _read_path(path: str) -> Any:
+    """Valore attuale di un path di find_parameters (i suffissi ':Nome' degli indici sono ignorati)."""
+    cur: Any = call("GET", "/composition")
+    for tok in path.split("/"):
+        m = INDEXED.match(tok)
+        try:
+            cur = cur[m.group(1)][int(m.group(2))] if m else cur[tok]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return cur.get("value") if isinstance(cur, dict) else cur
 
 
 @mcp.tool()
@@ -933,6 +953,330 @@ def show_check() -> dict:
         "colonne": len(c.get("columns", [])),
         "bpm": pval(c.get("tempocontroller") or {}, "tempo"),
     }
+
+
+# ------------------------------------------------------------ 1.3: avvio, ascolto, transport, uscite
+
+def _find_resolume() -> str | None:
+    env = os.environ.get("RESOLUME_EXE")
+    if env:
+        return env if os.path.isfile(env) else None
+    if sys.platform == "win32":
+        roots = [os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramW6432", "")]
+        for r in roots:
+            for app, exe in (("Resolume Arena", "Arena.exe"), ("Resolume Avenue", "Avenue.exe")):
+                p = os.path.join(r, app, exe) if r else ""
+                if p and os.path.isfile(p):
+                    return p
+    elif sys.platform == "darwin":
+        for app in ("/Applications/Resolume Arena/Arena.app", "/Applications/Resolume Avenue/Avenue.app"):
+            if os.path.isdir(app):
+                return app
+    return None
+
+
+@mcp.tool()
+def open_resolume(wait_seconds: int = 90) -> dict:
+    """Apre Resolume Arena/Avenue se non e' gia' aperto e aspetta che il web server risponda (per gli script e i
+    pilota automatici che partono prima del programma). Ricorda: Preferences -> Webserver -> Enable."""
+    try:
+        return {"opened": False, "already_running": True, "product": call("GET", "/product")}
+    except Exception:
+        pass
+    exe = _find_resolume()
+    if not exe:
+        raise RuntimeError("Resolume non trovato: imposta RESOLUME_EXE con il percorso di Arena.exe")
+    if exe.endswith(".app"):
+        subprocess.Popen(["open", exe])
+    elif exe.endswith(".py"):  # test: finto Resolume
+        subprocess.Popen([sys.executable, exe], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0
+        subprocess.Popen([exe], creationflags=flags, close_fds=True)
+    end = time.time() + max(5, min(wait_seconds, 300))
+    while time.time() < end:
+        try:
+            return {"opened": True, "exe": exe, "product": call("GET", "/product")}
+        except Exception:
+            time.sleep(1)
+    raise RuntimeError(f"Resolume avviato ({exe}) ma il web server non risponde: Preferences -> Webserver -> Enable (porta 8080)")
+
+
+@mcp.tool()
+def watch_parameters(query: str, seconds: float = 5.0, interval: float = 0.25, limit: int = 40) -> dict:
+    """Ascolta i parametri che contengono `query` (come find_parameters) per qualche secondo e riporta come
+    cambiano: per capire cosa muove l'operatore, se un effetto audio-reattivo reagisce o se il BPM e' stabile.
+    Restituisce per ogni parametro il primo e l'ultimo valore, min/max e quante volte e' cambiato."""
+    q = query.lower()
+    seconds = max(0.5, min(seconds, 60))
+    interval = max(0.05, min(interval, 5))
+    seen: dict[str, dict] = {}
+    end = time.time() + seconds
+    samples = 0
+    while True:
+        samples += 1
+        for path, p in walk_params(call("GET", "/composition")):
+            if q not in path.lower():
+                continue
+            v = p.get("value")
+            st = seen.get(path)
+            if st is None:
+                if len(seen) >= limit:
+                    continue
+                seen[path] = st = {"first": v, "last": v, "changes": 0}
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    st["min"] = st["max"] = v
+            elif v != st["last"]:
+                st["changes"] += 1
+                st["last"] = v
+            if "min" in st and isinstance(v, (int, float)):
+                st["min"], st["max"] = min(st["min"], v), max(st["max"], v)
+        if time.time() >= end:
+            break
+        time.sleep(interval)
+    moving = {k: v for k, v in seen.items() if v["changes"]}
+    return {"query": query, "seconds": seconds, "samples": samples, "watched": len(seen),
+            "changed": moving, "still": sorted(k for k in seen if k not in moving)[:limit]}
+
+
+def _trigger(path_body: dict) -> None:
+    """Parametri evento (tap, resync...): su e poi giu', come un tasto."""
+    call("PUT", "/composition", path_body(True))
+    time.sleep(0.03)
+    with contextlib.suppress(Exception):
+        call("PUT", "/composition", path_body(False))
+
+
+@mcp.tool()
+def tempo(action: str = "status", bpm: float | None = None, taps: int = 0) -> dict:
+    """Controller del tempo: status, set (bpm), tap (taps colpi: con taps=4 batte 4 volte al bpm dato o a 120),
+    resync (riporta la battuta a 1 adesso), nudge_up / nudge_down (spinge o frena per riallinearti a un DJ)."""
+    names = {"tap": "tempo_tap", "resync": "resync", "nudge_up": "tempo_push", "nudge_down": "tempo_pull"}
+    action = action.lower()
+    if action == "set":
+        if bpm is None:
+            raise ValueError("serve bpm")
+        call("PUT", "/composition", {"tempocontroller": {"tempo": {"value": float(bpm)}}})
+    elif action == "tap":
+        n = max(1, min(int(taps or 1), 16))
+        gap = 60.0 / float(bpm or 120)
+        for i in range(n):
+            _trigger(lambda v: {"tempocontroller": {"tempo_tap": {"value": v}}})
+            if i < n - 1:
+                time.sleep(max(0.0, gap - 0.03))
+    elif action in names:
+        _trigger(lambda v, k=names[action]: {"tempocontroller": {k: {"value": v}}})
+    elif action != "status":
+        raise ValueError("action: status | set | tap | resync | nudge_up | nudge_down")
+    tc = call("GET", "/composition").get("tempocontroller") or {}
+    return {"action": action, "bpm": pval(tc, "tempo"), "params": sorted(k for k in tc if isinstance(tc.get(k), dict))}
+
+
+@mcp.tool()
+def crossfader(phase: float | None = None, layer: int = 0, side: str = "") -> dict:
+    """Crossfader della composizione: phase da -1 (tutto A) a 1 (tutto B), 0 = meta'. Con layer + side
+    ('A', 'B' o 'none') assegna un layer a un lato. Senza argomenti legge lo stato e le assegnazioni."""
+    if phase is not None:
+        call("PUT", "/composition", {"crossfader": {"phase": {"value": max(-1.0, min(1.0, float(phase)))}}})
+    if layer and side:
+        lay = call("GET", f"/composition/layers/{layer}")
+        p = lay.get("crossfadergroup") or {}
+        opts = p.get("options") or ["None", "A", "B"]
+        want = next((o for o in opts if str(o).lower() == side.lower() or (side.lower() == "none" and str(o).lower() in ("none", "off", "-"))), None)
+        if want is None:
+            raise ValueError(f"side: {', '.join(map(str, opts))}")
+        call("PUT", f"/composition/layers/{layer}", {"crossfadergroup": {"value": want}})
+    c = call("GET", "/composition")
+    return {"phase": pval(c.get("crossfader") or {}, "phase"),
+            "layers": [{"layer": i, "name": pval(l, "name"), "side": pval(l, "crossfadergroup")}
+                       for i, l in enumerate(c.get("layers", []), start=1)]}
+
+
+def _pick(options: list, wanted: str, aliases: dict[str, tuple]) -> Any:
+    w = wanted.lower()
+    for o in options or []:
+        so = str(o).lower()
+        if so == w or so in aliases.get(w, ()):
+            return o
+    raise ValueError(f"'{wanted}' non valido. Opzioni: {options}")
+
+
+DIRECTION = {"forward": (">", "forward", "play"), "backward": ("<", "backward", "reverse"), "pause": ("||", "pause", "paused")}
+PLAYMODE = {"loop": ("loop",), "bounce": ("bounce",), "once": ("play once", "play once and clear", "once"),
+            "random": ("random",), "hold": ("play once and hold", "hold")}
+
+
+@mcp.tool()
+def clip_transport(layer: int, column: int, direction: str = "", play_mode: str = "", speed: float | None = None,
+                   restart: bool = False) -> dict:
+    """Transport di una clip: direction (forward, backward, pause), play_mode (loop, bounce, once, hold, random),
+    speed (1 = normale), restart (torna all'inizio). Legge prima le opzioni vere della clip, poi le imposta."""
+    path = f"/composition/layers/{layer}/clips/{column}"
+    clip = call("GET", path)
+    tr = clip.get("transport") or {}
+    ctl = tr.get("controls") or {}
+    body: dict = {}
+    if direction:
+        p = ctl.get("playdirection") or {}
+        body.setdefault("controls", {})["playdirection"] = {"value": _pick(p.get("options"), direction, DIRECTION)}
+    if play_mode:
+        p = ctl.get("playmode") or {}
+        body.setdefault("controls", {})["playmode"] = {"value": _pick(p.get("options"), play_mode, PLAYMODE)}
+    if speed is not None:
+        body.setdefault("controls", {})["speed"] = {"value": float(speed)}
+    if restart:
+        pos = tr.get("position") or {}
+        body["position"] = {"value": pos.get("min", 0)}
+    if body:
+        call("PUT", path, {"transport": body})
+        clip = call("GET", path)
+        tr, ctl = clip.get("transport") or {}, (clip.get("transport") or {}).get("controls") or {}
+    return {"clip": f"{layer}/{column}", "name": pval(clip, "name"), "direction": pval(ctl, "playdirection"),
+            "play_mode": pval(ctl, "playmode"), "speed": pval(ctl, "speed"), "position": pval(tr, "position")}
+
+
+@mcp.tool()
+def layer_summary(layer: int) -> dict:
+    """Tutto di un layer in poco spazio: blend mode, opacita', volume, transizione, lato del crossfader, effetti
+    con i loro parametri principali e clip (con media, velocita', modo di riproduzione)."""
+    l = call("GET", f"/composition/layers/{layer}")
+    v, a = l.get("video") or {}, l.get("audio") or {}
+    effects = []
+    for i, e in enumerate(v.get("effects", []), start=1):
+        params = {k: p.get("value") for k, p in (e.get("params") or {}).items() if isinstance(p, dict) and "value" in p}
+        effects.append({"effect": i, "name": pval(e, "name"), "bypassed": pval(e, "bypassed"), "params": dict(list(params.items())[:12])})
+    clips = []
+    for ci, c in enumerate(l.get("clips", []), start=1):
+        if not pval(c, "name"):
+            continue
+        ctl = (c.get("transport") or {}).get("controls") or {}
+        clips.append({"col": ci, "name": pval(c, "name"), "connected": pval(c, "connected"),
+                      "speed": pval(ctl, "speed"), "play_mode": pval(ctl, "playmode"),
+                      "has_media": bool(c.get("video") or c.get("audio"))})
+    tr = l.get("transition") or {}
+    return {"layer": layer, "name": pval(l, "name"), "opacity": pval(v, "opacity"),
+            "blend_mode": pval(v.get("mixer") or {}, "Blend Mode"), "volume": pval(a, "volume"),
+            "bypassed": pval(l, "bypassed"), "solo": pval(l, "solo"), "crossfader_side": pval(l, "crossfadergroup"),
+            "transition": {"duration": pval(tr, "duration"), "blend": pval(tr, "blend_mode")},
+            "effects": effects, "clips": clips}
+
+
+@mcp.tool()
+def layer_settings(layer: int, name: str = "", blend_mode: str = "", volume: float | None = None,
+                   transition_duration: float | None = None, transition_blend: str = "") -> dict:
+    """Impostazioni di un layer in una chiamata: nome, blend mode (es. 'Add', 'Screen', 'Multiply'), volume
+    audio, durata e blend della transizione tra clip. I nomi dei menu sono controllati sulle opzioni vere."""
+    l = call("GET", f"/composition/layers/{layer}")
+    body: dict = {}
+    if name:
+        body["name"] = {"value": name}
+    if blend_mode:
+        p = ((l.get("video") or {}).get("mixer") or {}).get("Blend Mode") or {}
+        opts = p.get("options") or []
+        val = next((o for o in opts if str(o).lower() == blend_mode.lower()), None)
+        if opts and val is None:
+            raise ValueError(f"blend_mode non valido. Opzioni: {opts}")
+        body["video"] = {"mixer": {"Blend Mode": {"value": val or blend_mode}}}
+    if volume is not None:
+        body["audio"] = {"volume": {"value": float(volume)}}
+    if transition_duration is not None or transition_blend:
+        t: dict = {}
+        if transition_duration is not None:
+            t["duration"] = {"value": max(0.0, float(transition_duration))}
+        if transition_blend:
+            p = (l.get("transition") or {}).get("blend_mode") or {}
+            opts = p.get("options") or []
+            val = next((o for o in opts if str(o).lower() == transition_blend.lower()), None)
+            if opts and val is None:
+                raise ValueError(f"transition_blend non valido. Opzioni: {opts}")
+            t["blend_mode"] = {"value": val or transition_blend}
+        body["transition"] = t
+    if not body:
+        return layer_summary(layer)
+    call("PUT", f"/composition/layers/{layer}", body)
+    return layer_summary(layer)
+
+
+@mcp.tool()
+def clip_thumbnail(layer: int, column: int) -> Image:
+    """Miniatura di una clip come immagine: Claude vede cosa c'e' nello slot prima di lanciarlo."""
+    r = http.request("GET", BASE + f"/composition/layers/{layer}/clips/{column}/thumbnail")
+    if r.status_code >= 400 or not r.content:
+        raise RuntimeError(f"miniatura non disponibile per la clip {layer}/{column} ({r.status_code})")
+    fmt = "png" if r.content[:4] == b"\x89PNG" else "jpeg"
+    return Image(data=r.content, format=fmt)
+
+
+AO_BACKUPS = HERE / "output_backups"
+
+
+def _ao_file() -> Path:
+    return Path(os.environ.get("RESOLUME_ADVANCED_OUTPUT", str(mapping.PREFS)))
+
+
+def _ao_summary(text: str) -> dict:
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        return {"error": f"XML non valido: {e}"}
+    screens = []
+    for sc in root.iter("Screen"):
+        slices = [s.get("name") or s.get("uniqueId") or "?" for s in sc.iter() if s.tag in ("Slice", "Polygon", "Mask", "Crop")]
+        screens.append({"name": sc.get("name"), "items": len(slices), "names": slices[:30]})
+    return {"screens": screens}
+
+
+@mcp.tool()
+def advanced_output(action: str = "status", name: str = "", confirm: bool = False) -> dict:
+    """Sicurezza per l'Advanced Output (AdvancedOutput.xml): status (schermi e slice), backup (copia con data in
+    output_backups/), list, diff (confronta lo stato attuale con un backup: schermi e slice aggiunti o tolti, righe
+    cambiate), restore (rimette un backup, serve confirm=True: poi in Resolume ricarica l'Advanced Output o riavvia)."""
+    src = _ao_file()
+    action = action.lower()
+    if action == "list":
+        AO_BACKUPS.mkdir(exist_ok=True)
+        return {"backups": sorted(p.stem for p in AO_BACKUPS.glob("*.xml"))}
+    if not src.is_file() and action != "restore":
+        raise RuntimeError(f"AdvancedOutput.xml non trovato in {src} (imposta RESOLUME_ADVANCED_OUTPUT)")
+    if action == "status":
+        return {"file": str(src), **_ao_summary(src.read_text(encoding="utf-8", errors="replace"))}
+    if action == "backup":
+        AO_BACKUPS.mkdir(exist_ok=True)
+        label = (name or time.strftime("%Y%m%d-%H%M%S")).strip()
+        dst = _dentro(AO_BACKUPS, label, ".xml")
+        dst.write_bytes(src.read_bytes())
+        return {"backup": dst.stem, "file": str(dst), **_ao_summary(dst.read_text(encoding="utf-8", errors="replace"))}
+    if not name:
+        raise ValueError("serve name del backup (vedi action='list')")
+    bk = _dentro(AO_BACKUPS, name, ".xml")
+    if not bk.is_file():
+        raise RuntimeError(f"backup non trovato: {name}")
+    if action == "diff":
+        import difflib
+        a, b = bk.read_text(encoding="utf-8", errors="replace"), src.read_text(encoding="utf-8", errors="replace")
+        sa, sb = _ao_summary(a), _ao_summary(b)
+        na = {s["name"] for s in sa.get("screens", [])}
+        nb = {s["name"] for s in sb.get("screens", [])}
+        items_a = {n for s in sa.get("screens", []) for n in s["names"]}
+        items_b = {n for s in sb.get("screens", []) for n in s["names"]}
+        lines = list(difflib.unified_diff(a.splitlines(), b.splitlines(), "backup", "attuale", lineterm="", n=0))
+        return {"identical": a == b, "screens_added": sorted(nb - na), "screens_removed": sorted(na - nb),
+                "slices_added": sorted(items_b - items_a), "slices_removed": sorted(items_a - items_b),
+                "changed_lines": sum(1 for x in lines if x[:1] in "+-" and x[:3] not in ("+++", "---")),
+                "diff": lines[:80]}
+    if action == "restore":
+        if msg := _confirm(f"sostituisce AdvancedOutput.xml con il backup '{name}'", confirm):
+            return {"needs_confirm": True, "message": msg}
+        if src.is_file():
+            AO_BACKUPS.mkdir(exist_ok=True)
+            (AO_BACKUPS / f"prima-del-restore-{time.strftime('%Y%m%d-%H%M%S')}.xml").write_bytes(src.read_bytes())
+        tmp = src.with_suffix(".xml.tmp")
+        tmp.write_bytes(bk.read_bytes())
+        os.replace(tmp, src)  # scrittura atomica
+        return {"restored": name, "file": str(src),
+                "note": "Ricarica l'Advanced Output in Resolume (o riavvialo) per vederlo. Lo stato di prima e' in output_backups/."}
+    raise ValueError("action: status | backup | list | diff | restore")
 
 
 # ---------------------------------------------------------------- passepartout

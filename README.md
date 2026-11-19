@@ -106,6 +106,20 @@ con il suo IP (es. `http://192.168.1.50:8080`).
 - `update_clip_thumbnail(layer, column)`
 - `show_check()` — controllo pre-show: master a 0, layer in bypass, slot senza media
 
+**Regia live e sicurezza** (1.3, 19 novembre 2026, secondo confronto con drohi-r: 206 tool)
+- `open_resolume(wait_seconds)` — apre Arena/Avenue se è chiuso e aspetta il web server (`RESOLUME_EXE`)
+- `watch_parameters(query, seconds)` — ascolta i parametri per qualche secondo: cosa si muove, min/max, quante volte
+- `tempo(status|set|tap|resync|nudge_up|nudge_down)` — tap tempo vero (N colpi al BPM dato), resync della battuta, spinte
+- `crossfader(phase, layer, side)` — fase A/B e assegnazione dei layer ai lati
+- `clip_transport(layer, column, direction, play_mode, speed, restart)` — avanti/indietro/pausa, loop/bounce/once/random
+- `layer_summary(layer)` · `layer_settings(layer, name, blend_mode, volume, transition_duration, transition_blend)`
+- `clip_thumbnail(layer, column)` — la miniatura come immagine: Claude vede lo slot prima di lanciarlo
+- `advanced_output(status|backup|list|diff|restore)` — backup con data dell'AdvancedOutput.xml, confronto (schermi e
+  slice aggiunti o tolti), ripristino atomico con conferma e copia di sicurezza dello stato precedente
+- `set_parameter(..., verify=True)` — rilegge e restituisce valore prima/dopo e se Resolume l'ha accettato
+
+Test senza Resolume: `python tests/test_offline.py` (finto Resolume in `tests/fake_resolume.py`).
+
 Gli strumenti distruttivi (`close_deck`, `clear_clip`, `remove_effect`, `disconnect_all`,
 `composition_file open/new`) senza `confirm=True` restituiscono solo una richiesta di conferma.
 
